@@ -7,6 +7,7 @@ from PySide6.QtGui import QMovie, QPixmap, QTransform
 import glob
 import random
 from core.event_bus import event_bus
+from ui.destination_marker import DestinationMarker
 
 class PetWindow(QWidget):
     """
@@ -80,6 +81,17 @@ class PetWindow(QWidget):
         
         # 监听统一下发的 state 更新
         event_bus.on_state_change.connect(self._on_state_change)
+        
+        # 监听标记召唤
+        event_bus.on_destination_set.connect(self._on_destination_set)
+        
+        # 标记相关状态
+        self._current_marker = None  # 当前目标标记
+        self._stay_timer = QTimer(self)  # 到达后的停留计时器
+        self._stay_timer.setSingleShot(True)
+        self._stay_timer.timeout.connect(self._on_stay_finished)
+        self._is_flying_to_marker = False
+        self._marker_target_pos = None
 
     def _preload_flying_frames(self):
         base_dir = os.path.join(os.path.dirname(__file__), '..', 'assets', 'parrot', 'Peach-faced-lovebird', 'flying_frames')
@@ -305,9 +317,16 @@ class PetWindow(QWidget):
             # 中断当前的所有漫游和自动飞行动作
             self.move_timer.stop()
             self.roam_timer.stop()
+            self._stay_timer.stop()
             if self._is_auto_moving:
                 self._is_auto_moving = False
+                self._is_flying_to_marker = False
                 self._load_image(random.choice(["idle", "curious"]))
+            
+            # 如果有标记，清除它
+            if self._current_marker:
+                self._current_marker.dismiss()
+                self._current_marker = None
                 
             # 记录鼠标按下时相对窗口的位置
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -369,4 +388,196 @@ class PetWindow(QWidget):
         self._rub_distance = 0
         self._last_rub_pos = None
         event.accept()
+    
+    # ==========================
+    # 标记召唤相关方法
+    # ==========================
+    
+    def _on_destination_set(self, target_pos: QPoint):
+        """
+        接收到标记位置，开始飞向目的地
+        """
+        if self.isHidden() or self.is_in_cage:
+            return
+        
+        # 停止当前的所有移动
+        self.move_timer.stop()
+        self.roam_timer.stop()
+        self._stay_timer.stop()
+        self._is_auto_moving = False
+        self._is_flying_to_marker = True
+        
+        # 创建标记显示
+        if self._current_marker:
+            self._current_marker.close()
+        self._current_marker = DestinationMarker(target_pos)
+        self._current_marker.show()
+        
+        # 计算带边界避让的目标位置（鸟的中心点）
+        self._marker_target_pos = self._calculate_safe_position(target_pos)
+        
+        # 开始飞行
+        self._start_flight_to_target(self._marker_target_pos)
+    
+    def _calculate_safe_position(self, marker_pos: QPoint) -> QPoint:
+        """
+        计算安全的飞行目标位置，确保鸟完整显示在屏幕内
+        鸟会飞到标记正上方，如果被边界挡住则智能偏移
+        """
+        screen_geo = QApplication.primaryScreen().geometry()
+        bird_width = self.width()
+        bird_height = self.height()
+        
+        # 默认飞到标记正上方（稍微偏上一点，避免挡住标记）
+        target_x = marker_pos.x() - bird_width // 2
+        target_y = marker_pos.y() - bird_height - 10  # 上方10px空隙
+        
+        # 边界检测与避让
+        # 左边界
+        if target_x < screen_geo.left():
+            target_x = screen_geo.left() + 5
+        # 右边界
+        elif target_x + bird_width > screen_geo.right():
+            target_x = screen_geo.right() - bird_width - 5
+        
+        # 上边界
+        if target_y < screen_geo.top():
+            target_y = screen_geo.top() + 5
+        # 下边界（标记可能在屏幕底部）
+        elif target_y + bird_height > screen_geo.bottom():
+            # 如果上方空间不够，飞到标记旁边
+            target_y = marker_pos.y() - bird_height // 2
+            # 重新检查上下边界
+            if target_y < screen_geo.top():
+                target_y = screen_geo.top() + 5
+            elif target_y + bird_height > screen_geo.bottom():
+                target_y = screen_geo.bottom() - bird_height - 5
+        
+        return QPoint(target_x, target_y)
+    
+    def _start_flight_to_target(self, target_pos: QPoint):
+        """开始飞向指定目标"""
+        self._target_pos = target_pos
+        self._start_pos = self.pos()
+        
+        # 计算距离和用时
+        dist_x = target_pos.x() - self._start_pos.x()
+        dist_y = target_pos.y() - self._start_pos.y()
+        distance = math.hypot(dist_x, dist_y)
+        
+        if distance < 10:
+            # 已经很近了，直接到达
+            self._on_arrived_at_marker()
+            return
+        
+        # 速度：大约 600 像素/秒（比漫游快一点）
+        speed = 600.0
+        self._flight_duration = max(0.5, distance / speed)  # 最少0.5秒
+        
+        # 标记召唤时使用较小的弧度
+        self._arc_height = distance * 0.15
+        
+        # 判断朝向
+        self._face_left = (dist_x <= 0)
+        
+        self._is_auto_moving = True
+        self._flight_start_time = time.time()
+        
+        # 切换到飞行动画
+        self._load_image("flying")
+        
+        # 启动移动定时器
+        self.move_timer.start(33)
+    
+    def _update_auto_move(self):
+        """更新自动移动（复用并扩展原有方法）"""
+        if not self._is_auto_moving or self._target_pos is None or self._start_pos is None:
+            self.move_timer.stop()
+            return
+        
+        elapsed = time.time() - self._flight_start_time
+        if self._flight_duration <= 0:
+            progress = 1.0
+        else:
+            progress = elapsed / self._flight_duration
+        
+        if progress >= 1.0:
+            progress = 1.0
+            self.move_timer.stop()
+            self._is_auto_moving = False
+            self.move(self._target_pos)
+            
+            # 如果是飞向标记，处理到达逻辑
+            if self._is_flying_to_marker:
+                self._on_arrived_at_marker()
+            else:
+                # 原有的漫游逻辑
+                self._on_roam_arrived()
+        else:
+            # Ease in out 缓动
+            eased_progress = -(math.cos(math.pi * progress) - 1.0) / 2.0
+            
+            base_x = self._start_pos.x() + (self._target_pos.x() - self._start_pos.x()) * eased_progress
+            base_y = self._start_pos.y() + (self._target_pos.y() - self._start_pos.y()) * eased_progress
+            
+            # 添加飞行弧度
+            arc_offset_y = -math.sin(progress * math.pi) * getattr(self, '_arc_height', 0)
+            
+            # 扑翼沉浮
+            flap_offset_y = math.sin(elapsed * math.pi * 5) * 8
+            
+            new_x = base_x
+            new_y = base_y + arc_offset_y + flap_offset_y
+            self.move(int(new_x), int(new_y))
+    
+    def _on_roam_arrived(self):
+        """漫游到达后的处理（原有逻辑）"""
+        screen_geo = QApplication.primaryScreen().geometry()
+        center_x = screen_geo.width() / 2.0
+        self._face_left = (self.pos().x() > center_x)
+        
+        rest_action = random.choice(["idle", "sleeping", "curious"])
+        self._load_image(rest_action)
+        
+        self.roam_timer.start(random.randint(5000, 15000))
+    
+    def _on_arrived_at_marker(self):
+        """到达标记后的处理"""
+        self._is_flying_to_marker = False
+        
+        # 切换到一个愉快的动画
+        self._load_image("happy")
+        
+        # 发射到达信号
+        event_bus.on_destination_arrived.emit()
+        
+        # 鸟到达后，标记立即消失
+        if self._current_marker:
+            self._current_marker.dismiss()  # 立即淡出消失
+            self._current_marker = None
+        
+        # 发射标记清除信号
+        event_bus.on_destination_cleared.emit()
+        
+        # 鸟停留90秒后恢复自由漫游
+        self._stay_timer.start(90000)
+    
+    def _on_stay_finished(self):
+        """停留结束，恢复自由漫游"""
+        # 清除标记
+        if self._current_marker:
+            self._current_marker.dismiss()
+            self._current_marker = None
+        
+        # 发射标记清除信号
+        event_bus.on_destination_cleared.emit()
+        
+        # 恢复漫游
+        if not self.isHidden():
+            self.roam_timer.start(random.randint(2000, 5000))
+    
+    @property
+    def is_in_cage(self):
+        """检查鸟是否在笼子里"""
+        return self.isHidden()
 

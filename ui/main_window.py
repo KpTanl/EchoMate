@@ -8,6 +8,7 @@ import glob
 import random
 from core.event_bus import event_bus
 from ui.settings_dialog import SettingsDialog
+from ui.mark_mode_overlay import MarkModeOverlay
 
 class MainWindow(QMainWindow):
     """
@@ -80,11 +81,18 @@ class MainWindow(QMainWindow):
         
         # 按钮容器
         self.btn_layout = QHBoxLayout()
-        self.fly_btn = QPushButton("放飞小鸟")
+        self.fly_btn = QPushButton("🐦 放飞小鸟")
         self.fly_btn.clicked.connect(self._on_fly_clicked)
         self.btn_layout.addWidget(self.fly_btn)
         
-        self.settings_btn = QPushButton("设置")
+        # 召唤按钮（鸟放出后才可用）
+        self.summon_btn = QPushButton("✨ 召唤到此处")
+        self.summon_btn.clicked.connect(self._on_summon_clicked)
+        self.summon_btn.setEnabled(False)  # 初始禁用，鸟在笼子里
+        self.summon_btn.setToolTip("鸟飞出笼子后，点击在屏幕上标记位置")
+        self.btn_layout.addWidget(self.summon_btn)
+        
+        self.settings_btn = QPushButton("⚙️ 设置")
         self.settings_btn.clicked.connect(self._on_settings_clicked)
         self.btn_layout.addWidget(self.settings_btn)
         self.cage_layout.addLayout(self.btn_layout)
@@ -194,11 +202,13 @@ class MainWindow(QMainWindow):
             self.raise_()
             self.activateWindow()
             self.image_label.show()
-            self.fly_btn.setText("放飞小鸟")
+            self.fly_btn.setText("🐦 放飞小鸟")
+            self.summon_btn.setEnabled(False)  # 鸟在笼子里，禁用召唤
             self._load_image(self.current_action) # 恢复展示时重新激活内部逻辑
         else:
             self.image_label.hide()
-            self.fly_btn.setText("把鸟儿唤回笼子")
+            self.fly_btn.setText("🏠 把鸟儿唤回笼子")
+            self.summon_btn.setEnabled(True)  # 鸟飞出去了，启用召唤
             self.anim_timer.stop() # 离开笼子时关闭动画，由 pet window 接管
             
     def _on_send_msg(self):
@@ -214,3 +224,39 @@ class MainWindow(QMainWindow):
     def _on_agent_reply(self, reply: str):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self.chat_display.append(f"<span style='color:#999;font-size:10px;'>[{timestamp}]</span> <b>鸟儿:</b> {reply}<br>")
+    
+    def _on_summon_clicked(self):
+        """点击召唤按钮，进入标记模式"""
+        if self.is_bird_in_cage:
+            return
+        
+        print("[MainWindow] 开始标记模式...")
+        
+        # 先隐藏主窗口避免遮挡
+        self.hide()
+        
+        # 创建标记覆盖层
+        self._overlay = MarkModeOverlay(self)
+        self._overlay.position_marked.connect(self._on_position_marked)
+        self._overlay.cancelled.connect(self._on_mark_cancelled)
+        self._overlay.show()
+        self._overlay.raise_()
+        self._overlay.activateWindow()
+        
+        # 发射信号
+        event_bus.on_mark_mode_start.emit()
+    
+    def _on_position_marked(self, pos):
+        """位置被标记"""
+        print(f"[MainWindow] 标记位置: {pos}")
+        event_bus.on_destination_set.emit(pos)
+        self._overlay = None
+        # 重新显示主窗口
+        self.show()
+    
+    def _on_mark_cancelled(self):
+        """用户取消标记"""
+        print("[MainWindow] 标记取消")
+        self._overlay = None
+        # 重新显示主窗口
+        self.show()

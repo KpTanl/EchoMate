@@ -25,5 +25,11 @@ class _EventBus(QObject):
     on_user_input = Signal(str)
     on_agent_response = Signal(str)
 
+    # 标记召唤相关信号
+    on_mark_mode_start = Signal()           # 开始标记模式
+    on_destination_set = Signal(object)     # 设置目的地 (QPoint)
+    on_destination_arrived = Signal()       # 鸟到达目的地
+    on_destination_cleared = Signal()       # 标记被清除
+
 # 暴露单例实例
 event_bus = _EventBus()
